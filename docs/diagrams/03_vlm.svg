@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360" font-family="Arial, sans-serif">
+  <rect width="900" height="360" fill="#F7F9FB"/>
+  <text x="450" y="32" text-anchor="middle" font-size="18" font-weight="bold" fill="#0A1929">VLM / LLM Threshold Derivation (--scene-type auto)</text>
+
+  <!-- thumbnail -->
+  <rect x="40" y="90" width="130" height="100" rx="8" fill="#FFFFFF" stroke="#5A6C7A" stroke-width="1.5"/>
+  <text x="105" y="130" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">SAR thumbnail</text>
+  <text x="105" y="150" text-anchor="middle" font-size="10" fill="#5A6C7A">max side ≈ 512px</text>
+
+  <line x1="170" y1="140" x2="210" y2="140" stroke="#00A896" stroke-width="2.5" marker-end="url(#ar3)"/>
+
+  <!-- GeoChat -->
+  <rect x="220" y="80" width="170" height="120" rx="8" fill="#FFFFFF" stroke="#9B59B6" stroke-width="1.5"/>
+  <rect x="220" y="80" width="6" height="120" rx="3" fill="#9B59B6"/>
+  <text x="308" y="108" text-anchor="middle" font-size="13" font-weight="bold" fill="#0A1929">GeoChat (7B VLM)</text>
+  <text x="308" y="128" text-anchor="middle" font-size="10" fill="#5A6C7A">LLaVA + CLIP ViT-L/14</text>
+  <text x="308" y="144" text-anchor="middle" font-size="10" fill="#5A6C7A">prompt explains SAR</text>
+  <text x="308" y="158" text-anchor="middle" font-size="10" fill="#5A6C7A">brightness convention</text>
+  <text x="308" y="180" text-anchor="middle" font-size="10" font-style="italic" fill="#9B59B6">→ scene description (text)</text>
+
+  <line x1="390" y1="140" x2="430" y2="140" stroke="#00A896" stroke-width="2.5" marker-end="url(#ar3)"/>
+
+  <!-- Groq -->
+  <rect x="440" y="80" width="170" height="120" rx="8" fill="#FFFFFF" stroke="#2E86AB" stroke-width="1.5"/>
+  <rect x="440" y="80" width="6" height="120" rx="3" fill="#2E86AB"/>
+  <text x="528" y="108" text-anchor="middle" font-size="13" font-weight="bold" fill="#0A1929">Groq LLaMA-4</text>
+  <text x="528" y="128" text-anchor="middle" font-size="10" fill="#5A6C7A">system prompt with</text>
+  <text x="528" y="144" text-anchor="middle" font-size="10" fill="#5A6C7A">SAR physics + bounds</text>
+  <text x="528" y="160" text-anchor="middle" font-size="10" fill="#5A6C7A">temp = 0.1</text>
+  <text x="528" y="182" text-anchor="middle" font-size="10" font-style="italic" fill="#2E86AB">→ JSON output</text>
+
+  <line x1="610" y1="140" x2="650" y2="140" stroke="#00A896" stroke-width="2.5" marker-end="url(#ar3)"/>
+
+  <!-- output -->
+  <rect x="660" y="90" width="200" height="100" rx="8" fill="#FFFFFF" stroke="#1A7A4A" stroke-width="1.5"/>
+  <rect x="660" y="90" width="6" height="100" rx="3" fill="#1A7A4A"/>
+  <text x="765" y="116" text-anchor="middle" font-size="11" font-weight="bold" fill="#0A1929">{ scene_type,</text>
+  <text x="765" y="134" text-anchor="middle" font-size="11" font-weight="bold" fill="#0A1929">  road_thresh,</text>
+  <text x="765" y="152" text-anchor="middle" font-size="11" font-weight="bold" fill="#0A1929">  bareland_thresh }</text>
+  <text x="765" y="176" text-anchor="middle" font-size="9" fill="#5A6C7A">feeds P10 multipliers + P11 carving</text>
+
+  <!-- fallback -->
+  <rect x="220" y="240" width="640" height="70" rx="8" fill="#FDECEA" stroke="#C0392B" stroke-width="1"/>
+  <text x="240" y="266" font-size="11" font-weight="bold" fill="#C0392B">Fallback on any failure:</text>
+  <text x="240" y="286" font-size="10" fill="#5A6C7A">Model load error, network failure, malformed JSON, or timeout → default to scene_type = "urban"</text>
+  <text x="240" y="302" font-size="10" fill="#5A6C7A">(safest default: urban multipliers/thresholds are least aggressive, degrade gracefully). See ASSUMPTIONS.md §5.5</text>
+
+  <text x="40" y="250" font-size="10" fill="#9BAAB8" transform="rotate(-90 40 250)">validated ±0.03 of hand-tuned</text>
+
+  <defs>
+    <marker id="ar3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#00A896"/>
+    </marker>
+  </defs>
+</svg>

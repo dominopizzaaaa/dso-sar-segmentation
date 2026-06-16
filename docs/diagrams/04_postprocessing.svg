@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" font-family="Arial, sans-serif">
+  <rect width="900" height="520" fill="#F7F9FB"/>
+  <text x="450" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#0A1929">Stages 2 &amp; 3 — Post-Processing (P10 then P11)</text>
+
+  <!-- P10 header -->
+  <rect x="40" y="55" width="820" height="28" fill="#E67E22"/>
+  <text x="55" y="74" font-size="13" font-weight="bold" fill="#FFFFFF">STAGE 2 — P10 Soft Confidence Refinement</text>
+
+  <!-- P10 steps -->
+  <g>
+    <rect x="40" y="95" width="190" height="95" rx="8" fill="#FFFFFF" stroke="#E67E22" stroke-width="1.3"/>
+    <text x="135" y="118" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">① Soften</text>
+    <text x="135" y="138" text-anchor="middle" font-size="10" fill="#5A6C7A">hard labels → soft</text>
+    <text x="135" y="153" text-anchor="middle" font-size="10" fill="#5A6C7A">Gaussian σ=3</text>
+    <text x="135" y="168" text-anchor="middle" font-size="10" fill="#5A6C7A">renormalise per pixel</text>
+
+    <rect x="245" y="95" width="190" height="95" rx="8" fill="#FFFFFF" stroke="#E67E22" stroke-width="1.3"/>
+    <text x="340" y="118" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">② Scene multipliers</text>
+    <text x="340" y="138" text-anchor="middle" font-size="10" fill="#5A6C7A">mine: bld×0.02 bare×2.0</text>
+    <text x="340" y="153" text-anchor="middle" font-size="10" fill="#5A6C7A">port: water×1.3</text>
+    <text x="340" y="168" text-anchor="middle" font-size="10" fill="#5A6C7A">urban: bld×1.2</text>
+
+    <rect x="450" y="95" width="190" height="95" rx="8" fill="#FFFFFF" stroke="#E67E22" stroke-width="1.3"/>
+    <text x="545" y="118" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">③ SAR decomp</text>
+    <text x="545" y="138" text-anchor="middle" font-size="10" fill="#5A6C7A">bright road → ↓road</text>
+    <text x="545" y="153" text-anchor="middle" font-size="10" fill="#5A6C7A">dark building → ↓bld</text>
+    <text x="545" y="168" text-anchor="middle" font-size="10" fill="#5A6C7A">bright water → ↓water</text>
+
+    <rect x="655" y="95" width="190" height="95" rx="8" fill="#FFFFFF" stroke="#E67E22" stroke-width="1.3"/>
+    <text x="750" y="118" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">④ Guided filter</text>
+    <text x="750" y="138" text-anchor="middle" font-size="10" fill="#5A6C7A">SAR as guide</text>
+    <text x="750" y="153" text-anchor="middle" font-size="10" fill="#5A6C7A">r=3, ε=0.001</text>
+    <text x="750" y="168" text-anchor="middle" font-size="10" fill="#5A6C7A">then re-argmax</text>
+  </g>
+  <line x1="230" y1="142" x2="243" y2="142" stroke="#E67E22" stroke-width="2" marker-end="url(#ar4)"/>
+  <line x1="435" y1="142" x2="448" y2="142" stroke="#E67E22" stroke-width="2" marker-end="url(#ar4)"/>
+  <line x1="640" y1="142" x2="653" y2="142" stroke="#E67E22" stroke-width="2" marker-end="url(#ar4)"/>
+
+  <!-- down -->
+  <line x1="450" y1="195" x2="450" y2="235" stroke="#5A6C7A" stroke-width="2" marker-end="url(#ar5)"/>
+  <text x="465" y="220" font-size="10" fill="#5A6C7A">cleaner P10 map →</text>
+
+  <!-- P11 header -->
+  <rect x="40" y="250" width="820" height="28" fill="#00A896"/>
+  <text x="55" y="269" font-size="13" font-weight="bold" fill="#FFFFFF">STAGE 3 — P11 Watershed Edge Carving</text>
+
+  <!-- P11 steps -->
+  <rect x="40" y="290" width="255" height="120" rx="8" fill="#FFFFFF" stroke="#00A896" stroke-width="1.3"/>
+  <text x="167" y="314" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">① Water flood-fill</text>
+  <text x="167" y="334" text-anchor="middle" font-size="10" fill="#5A6C7A">dark (&lt;12th pct) + smooth</text>
+  <text x="167" y="349" text-anchor="middle" font-size="10" fill="#5A6C7A">(var&lt;0.003) + edge-connected</text>
+  <text x="167" y="364" text-anchor="middle" font-size="10" fill="#5A6C7A">→ relabel as water</text>
+  <text x="167" y="386" text-anchor="middle" font-size="10" font-style="italic" fill="#5A6C7A">fixes water/bareland confusion</text>
+
+  <rect x="320" y="290" width="255" height="120" rx="8" fill="#FFFFFF" stroke="#00A896" stroke-width="1.3"/>
+  <text x="447" y="314" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">② Watershed carving</text>
+  <text x="447" y="334" text-anchor="middle" font-size="10" fill="#5A6C7A">road blobs &gt; 2000px</text>
+  <text x="447" y="349" text-anchor="middle" font-size="10" fill="#5A6C7A">seed dark=road / med=bare /</text>
+  <text x="447" y="364" text-anchor="middle" font-size="10" fill="#5A6C7A">bright=building, flood on SAR</text>
+  <text x="447" y="386" text-anchor="middle" font-size="10" font-style="italic" fill="#5A6C7A">splits mine-terrace blobs</text>
+
+  <rect x="600" y="290" width="245" height="120" rx="8" fill="#FFFFFF" stroke="#00A896" stroke-width="1.3"/>
+  <text x="722" y="314" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">③ Building outlines</text>
+  <text x="722" y="334" text-anchor="middle" font-size="10" fill="#5A6C7A">Sobel gradient on SAR</text>
+  <text x="722" y="349" text-anchor="middle" font-size="10" fill="#5A6C7A">90th pct edges inside blob</text>
+  <text x="722" y="364" text-anchor="middle" font-size="10" fill="#5A6C7A">draw black outline</text>
+  <text x="722" y="386" text-anchor="middle" font-size="10" font-style="italic" fill="#5A6C7A">crisp building boundaries</text>
+
+  <line x1="295" y1="350" x2="318" y2="350" stroke="#00A896" stroke-width="2" marker-end="url(#ar4)"/>
+  <line x1="575" y1="350" x2="598" y2="350" stroke="#00A896" stroke-width="2" marker-end="url(#ar4)"/>
+
+  <!-- output -->
+  <line x1="450" y1="410" x2="450" y2="445" stroke="#5A6C7A" stroke-width="2" marker-end="url(#ar5)"/>
+  <rect x="320" y="450" width="255" height="50" rx="8" fill="#FFFFFF" stroke="#1A7A4A" stroke-width="1.5"/>
+  <text x="447" y="472" text-anchor="middle" font-size="12" font-weight="bold" fill="#0A1929">Final segmentation</text>
+  <text x="447" y="490" text-anchor="middle" font-size="10" fill="#5A6C7A">colour PNG + .npy</text>
+
+  <defs>
+    <marker id="ar4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,3 L0,6 Z" fill="#00A896"/></marker>
+    <marker id="ar5" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,3 L0,6 Z" fill="#5A6C7A"/></marker>
+  </defs>
+</svg>

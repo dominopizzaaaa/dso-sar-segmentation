@@ -1,0 +1,27 @@
+name: sar-seg
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch>=2.0
+      - torchvision
+      - numpy<2.0
+      - pillow
+      - rasterio
+      - scipy
+      - scikit-image
+      - open_clip_torch
+      - ftfy
+      - regex
+      - tqdm
+# Notes:
+#   - numpy pinned <2.0 to avoid the torch/numpy ABI incompatibility seen
+#     on the development cluster (see docs/ASSUMPTIONS.md and PIPELINE.md).
+#   - For --scene-type auto you additionally need the GeoChat repo and its
+#     dependencies installed under models/GeoChat (LLaVA-style stack).
+#   - CUDA-enabled torch is strongly recommended; CPU inference is very slow.

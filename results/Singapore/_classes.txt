@@ -1,0 +1,6 @@
+background
+building
+road
+vegetation
+water
+bareland
