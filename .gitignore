@@ -1,0 +1,7 @@
+groq_key.txt
+logs/
+results/**/*.png
+results/**/*.npy
+results/**/*.txt
+models/GeoChat/
+models/SegEarth-OV-2/
