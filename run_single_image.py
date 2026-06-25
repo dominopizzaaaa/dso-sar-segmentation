@@ -135,6 +135,7 @@ def load_alignearth_model(device, class_file, segearth_path):
         cls_token_lambda=0,
         ignore_residual=False,
         feature_up=False,
+        device=device,
     )
     os.chdir(orig_dir)
     return model.to(device).eval()
