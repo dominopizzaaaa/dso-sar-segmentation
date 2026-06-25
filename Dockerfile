@@ -11,7 +11,7 @@
 # natively.
 #
 # Model weights are NOT baked in (too large / licensed). They are
-# mounted at run time — see the run commands below / DOCKER.md.
+# mounted at run time.
 # ===================================================================
 
 # Plain Ubuntu 22.04 — no CUDA. Small, runs anywhere.
@@ -19,6 +19,13 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+
+# ---- Global numpy<2 lock ----
+# torch 2.1.2 is built against numpy 1.x. A later dependency install can
+# silently upgrade numpy to 2.x and break torch. PIP_CONSTRAINT forces
+# EVERY pip/mim install for the rest of the build to honor this pin.
+RUN echo "numpy<2.0" > /etc/pip-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
 
 # ---- System packages ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -37,7 +44,6 @@ RUN ln -sf /usr/bin/python3.10 /usr/bin/python && \
     ln -sf /usr/bin/python3.10 /usr/bin/python3
 
 # ---- Python dependencies ----
-# numpy pinned <2.0 to avoid the ABI incompatibility.
 RUN pip install --no-cache-dir "numpy<2.0" "setuptools<81" wheel
 
 # torch CPU build (2.1.2 — matches the mmcv cpu/torch2.1 wheel below)
@@ -65,9 +71,14 @@ RUN pip install --no-cache-dir -U openmim && \
         -f https://download.openmmlab.com/mmcv/dist/cpu/torch2.1/index.html && \
     pip install --no-cache-dir mmsegmentation
 
-# Sanity check at build time — fail the CI build early if imports break.
-RUN python -c "import torch, mmcv, mmseg, mmengine, rasterio, skimage, open_clip; \
-print('torch', torch.__version__, '| mmcv', mmcv.__version__, '| mmseg', mmseg.__version__)"
+# Belt-and-suspenders: reassert numpy<2 in case mim's pip pass bumped it,
+# then verify numpy<->torch interop actually works (not just that imports
+# succeed). This fails the build loudly if numpy is wrong.
+RUN pip install --no-cache-dir "numpy<2.0" && \
+    python -c "import numpy as np, torch, mmcv, mmseg, mmengine, rasterio, skimage, open_clip; \
+assert np.__version__.startswith('1.'), 'numpy must be <2, got ' + np.__version__; \
+assert torch.from_numpy(np.zeros((2,2), dtype='float32')).sum().item() == 0.0; \
+print('OK | numpy', np.__version__, '| torch', torch.__version__, '| mmcv', mmcv.__version__, '| mmseg', mmseg.__version__)"
 
 # ---- Project code ----
 WORKDIR /app
