@@ -138,7 +138,7 @@ def load_alignearth_model(device, class_file, segearth_path):
         device=device,
     )
     os.chdir(orig_dir)
-    return model.to(device).eval()
+    return model.to(device).float().eval()
 
 
 def run_alignearth(model, sar_norm, H, W, device):
