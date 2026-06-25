@@ -20,6 +20,50 @@ Outputs written to --output:
     <name>_p10.png   after soft-confidence refinement
     <name>_final.png final P11 result with building outlines
     <name>_final.npy final class array (uint8, 0-5)
+
+===================================================================
+PIPELINE OVERVIEW (read this before diving into the functions below)
+===================================================================
+The pipeline runs in three stages, each one cleaning up the previous
+stage's mistakes using a different kind of evidence:
+
+  STAGE 1 (P8)  load_alignearth_model() + run_alignearth()
+      A CLIP-style vision-language model (AlignEarth, a SAR-specific
+      encoder distilled from optical CLIP) slides a 448x448 window
+      across the full scene and predicts one of 6 classes per pixel,
+      purely from learned visual patterns. This stage knows nothing
+      about brightness rules or scene type -- it's the model's raw,
+      "first guess" semantic segmentation. Output: a hard label map
+      (one integer 0-5 per pixel) called pred_p8.
+
+  STAGE 2 (P10) apply_p10()
+      The hard P8 labels get converted into "soft" per-class
+      probabilities (via Gaussian blurring -- see apply_p10's
+      docstring), then those probabilities get reweighted using
+      (a) fixed scene-type priors (e.g. "mines rarely have real
+      buildings"), and (b) real SAR brightness/texture statistics
+      computed directly from the image. The probabilities are then
+      re-collapsed to a refined hard label map, pred_p10. This stage
+      fixes systematic model biases (e.g. bright rocks misread as
+      buildings) using domain knowledge the model itself doesn't have.
+
+  STAGE 3 (P11) apply_p11()
+      Two further fixes, both geometry/brightness driven rather than
+      learned: (a) a flood-fill pass that finds large, smooth, dark
+      regions touching the image border and forces them to "water"
+      (catches big water bodies the model may have mislabeled), and
+      (b) "edge carving" -- for any class-2 (road) blob made of mixed
+      brightness, run a watershed transform to split it into the
+      sub-regions it should actually be (road/bareland/building),
+      since AlignEarth's coarse 448px tiling tends to blur several
+      adjacent materials into one label. Output: pred_p11, the final
+      class map, plus add_building_outlines() draws dark edge lines
+      around buildings purely for visual clarity in the output PNG.
+
+Net effect: P8 = "what does the model think this looks like",
+P10 = "what does this look like once we apply domain priors and
+brightness evidence", P11 = "clean up the geometry so blobs don't
+straddle multiple real materials".
 ===================================================================
 """
 
@@ -84,6 +128,11 @@ AE_STRIDE = 224    # 50% overlap between adjacent tiles
 AE_INPUT = 224     # size each tile is resized to before the model
 
 # P10 scene-type confidence multipliers (see ASSUMPTIONS.md)
+# These are fixed, hand-picked priors -- NOT learned from data. They
+# encode domain knowledge like "open-pit mines almost never contain
+# real buildings, so any 'building' prediction there is probably a
+# misread bright rock pile" (hence the 0.02 multiplier for class 1
+# under "mine" -- it suppresses that class's probability by 98%).
 CONFIDENCE_ADJUST = {
     "mine":  {1: 0.02, 2: 0.3, 3: 0.3, 4: 0.5, 5: 2.0},
     "port":  {1: 1.0,  2: 1.0, 3: 0.9, 4: 1.3, 5: 0.8},
@@ -91,6 +140,12 @@ CONFIDENCE_ADJUST = {
 }
 
 # P11 hard-coded brightness thresholds per scene type (see ASSUMPTIONS.md)
+# In SAR, brightness roughly correlates with surface roughness: smooth
+# surfaces (water, asphalt roads) scatter the radar signal away from
+# the sensor and look dark; rough/vertical surfaces (buildings) scatter
+# strongly back and look bright. These per-scene-type cutoffs say
+# "below this brightness = road-like, above this = building-like,
+# in between = bareland".
 BRIGHTNESS_THRESHOLDS = {
     "mine":  {"road": 0.12, "bareland": 0.50},
     "port":  {"road": 0.15, "bareland": 0.45},
@@ -104,7 +159,33 @@ CARVE_MIN_AREA = 2000  # only carve road blobs larger than this (pixels)
 # STAGE 0 - SAR LOADING & NORMALISATION
 # ===================================================================
 def load_sar(tif_path):
-    """Read a SAR GeoTIFF and normalise to [0,1] via 2-98 percentile stretch."""
+    """
+    Read a SAR GeoTIFF and normalise it to a [0, 1] brightness scale.
+
+    WHAT IT DOES:
+      1. Opens the .tif with rasterio and reads band 1 (SAR images are
+         single-channel -- pure backscatter intensity, no colour).
+      2. `valid = sar > 0` marks pixels with real data (some SAR scenes
+         have 0-value padding around the actual footprint -- those
+         pixels should never be classified as anything and get masked
+         out later).
+      3. Computes the 2nd and 98th percentile brightness across only
+         the valid pixels (p2, p98). This is a robust way to find
+         "typical" dark and bright bounds while ignoring extreme
+         outlier pixels (sensor noise spikes, etc.) that a plain
+         min/max would be thrown off by.
+      4. Linearly rescales every pixel so that p2 -> 0.0 and p98 -> 1.0,
+         then clips anything outside [0, 1]. This is a standard
+         "percentile stretch" -- it makes brightness comparable across
+         different scenes that might have very different raw intensity
+         ranges (e.g. due to different sensor gain settings).
+
+    RETURNS:
+      sar_norm : float32 array (H, W), brightness rescaled to [0, 1]
+      valid    : bool array (H, W), True where the original pixel had
+                 real (non-zero) data
+      H, W     : the image's height and width in pixels
+    """
     with rasterio.open(tif_path) as src:
         H, W = src.height, src.width
         sar = src.read(1).astype(np.float32)
@@ -118,6 +199,70 @@ def load_sar(tif_path):
 # STAGE 1 - ALIGNEARTH INFERENCE (P8)
 # ===================================================================
 def load_alignearth_model(device, class_file, segearth_path):
+    """
+    Load the AlignEarth model (a CLIP-style vision-language encoder,
+    specifically the SAR-adapted variant of SegEarth-OV-2's open-
+    vocabulary segmentation framework) onto the given device (CPU/GPU)
+    and prepare it for inference.
+
+    KEY DETAIL -- the directory change:
+      SegEarth-OV-2's own model code hardcodes the checkpoint path as
+      the *relative* string 'checkpoint/AlignEarth-SAR-ViT-B-16.pt'.
+      A relative path is resolved against the current working
+      directory at the moment it's opened -- so this function
+      temporarily `os.chdir()`s into the SegEarth-OV-2 folder before
+      constructing the model (so that relative path correctly finds
+      checkpoint/AlignEarth-SAR-ViT-B-16.pt sitting inside that
+      folder), then changes back to wherever the script was running
+      from afterward. `class_file` (the list of class names this
+      model should predict) is resolved to an *absolute* path first,
+      specifically so that step doesn't break once the cwd changes.
+
+    PARAMETERS PASSED TO SegEarthSegmentation (the actual model class,
+    defined in SegEarth-OV-2's segearth_segmentor.py):
+      clip_type="AlignEarth"   -- selects the SAR-distilled encoder
+                                   branch (as opposed to plain CLIP,
+                                   RemoteCLIP, BLIP, etc. -- this
+                                   codebase supports many backbones,
+                                   we only ever use this one)
+      vit_type="ViT-B/16"      -- the underlying transformer's size/
+                                   patch-size variant
+      model_type="SCLIP"       -- the segmentation head/strategy used
+                                   to turn the model's patch features
+                                   into a per-pixel class map
+      name_path=class_file_abs -- the 6 class names this model should
+                                   score against (background, building,
+                                   road, vegetation, water, bareland)
+      logit_scale=100          -- a temperature-like scaling factor
+                                   applied to the model's raw
+                                   similarity scores before softmax;
+                                   higher = more confident/peaked
+                                   predictions
+      cls_token_lambda=0       -- weight given to the model's global
+                                   [CLS] token vs. local patch tokens;
+                                   0 means rely purely on local patch
+                                   evidence (better for per-pixel
+                                   segmentation than the whole-image
+                                   summary)
+      ignore_residual=False    -- whether to skip a particular
+                                   residual-connection adjustment
+                                   inside the model's attention layers
+      feature_up=False         -- whether to run the optional
+                                   SimFeatUp upsampling module (skipped
+                                   here -- not needed by our 448px
+                                   tiling approach)
+      device=device            -- explicitly passed so the model loads
+                                   on CPU or GPU correctly; without
+                                   this, SegEarthSegmentation defaults
+                                   to assuming a GPU is always present
+
+    RETURNS: the model, moved to `device`, forced to float32 precision
+    (.float()), and set to evaluation mode (.eval(), which disables
+    dropout/batch-norm-update behaviour used only during training).
+    Forcing fp32 here matters on CPU specifically: several PyTorch CPU
+    kernels (matmul, conv2d) simply have no implementation for fp16
+    ("Half") tensors, since fp16 is a GPU-only speed optimisation.
+    """
     import os
     # Resolve class_file to absolute path BEFORE changing directory
     class_file_abs = str(os.path.abspath(class_file))
@@ -142,7 +287,86 @@ def load_alignearth_model(device, class_file, segearth_path):
 
 
 def run_alignearth(model, sar_norm, H, W, device):
-    """Sliding-window AlignEarth inference. Returns hard label map (H,W)."""
+    """
+    Run sliding-window AlignEarth inference across the full SAR scene
+    and return a hard (single integer per pixel) label map. This is
+    "P8" -- the model's raw first-pass semantic segmentation, before
+    any of the P10/P11 refinement.
+
+    WHY TILING IS NEEDED:
+    SAR scenes here are enormous (tens of thousands of pixels per
+    side) but the model only accepts small, fixed-size inputs
+    (AE_INPUT = 224x224). So the image is processed in overlapping
+    448x448 tiles (AE_TILE), each downsized to 224x224 before going
+    into the model, and the resulting per-tile predictions are
+    stitched back together into a full-resolution map.
+
+    STEP-BY-STEP:
+
+    1. CLIP normalisation constants (`mean`, `std`):
+       AlignEarth's vision tower is architecturally a CLIP ViT-B/16,
+       which expects 3-channel input normalised by these exact
+       per-channel mean/std values -- the same constants used when the
+       original CLIP model was trained on natural optical photos. They
+       aren't SAR-specific; they're inherited because this model's
+       conv layer weights were shaped for that input distribution.
+
+    2. `transform(patch_rgb)`:
+       Resizes a 448x448 patch down to 224x224 (AE_INPUT, the model's
+       expected input size) using Lanczos resampling, applies the
+       mean/std normalisation above, and rearranges the array from
+       HWC (height, width, channel) to CHW (channel, height, width) --
+       the layout PyTorch convolution layers expect. The struct.pack/
+       np.frombuffer round-trip is a defensive workaround: it forces a
+       byte-for-byte copy through Python's struct module rather than
+       letting numpy and torch share memory directly, which sidesteps
+       a known ABI (binary interface) mismatch that can occur between
+       certain numpy and torch versions.
+
+    3. Faking 3 channels from 1:
+       `sar_rgb = np.stack([...] * 3, axis=-1)` duplicates the single
+       grayscale SAR brightness channel three times, producing a fake
+       "RGB" image where R=G=B=SAR brightness. This satisfies the
+       model's structural requirement for 3-channel input (inherited
+       from CLIP/optical-image pretraining) without needing to retrain
+       or reshape the first conv layer.
+
+    4. Building tile positions:
+       A grid of (y, x) top-left tile coordinates is generated with
+       50% overlap (AE_STRIDE = 224, half of AE_TILE = 448) so that no
+       seam falls exactly on a real object boundary every time. The
+       extra clamping logic after the main grid loop makes sure tiles
+       are also placed flush against the bottom and right edges of the
+       image even if the image's dimensions aren't an exact multiple
+       of the stride -- otherwise a strip along those edges would
+       never get covered by any tile.
+
+    5. Per-tile inference loop:
+       For each tile: skip it entirely if it's pure zero-padding
+       (`patch.max() == 0` -- nothing to classify). Otherwise, run it
+       through the model (`model.forward_feature`) to get raw class
+       logits, upsample those logits back from the model's internal
+       resolution to the full 448x448 tile size (`F.interpolate`,
+       bilinear), and convert logits to per-class probabilities with
+       softmax. These per-pixel, per-class probabilities are
+       accumulated into `prob_sum` at this tile's location, and
+       `count_map` tracks how many overlapping tiles touched each
+       pixel (since tiles overlap by 50%, most pixels get covered by
+       more than one tile).
+
+    6. Averaging overlapping predictions:
+       `prob_sum / count_map` averages together every tile's opinion
+       about each pixel (pixels near the middle of an object, covered
+       by many tiles, get an averaged, smoothed-out probability;
+       `np.maximum(count_map, 1)` just guards against a division by
+       zero for any pixel that somehow got zero coverage).
+
+    7. Final collapse to hard labels:
+       `.argmax(axis=0)` picks whichever of the 6 classes has the
+       highest averaged probability for each pixel, producing the
+       final single-integer-per-pixel P8 label map that gets passed
+       into apply_p10() next.
+    """
     mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
     std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
@@ -204,6 +428,29 @@ def run_alignearth(model, sar_norm, H, W, device):
 # STAGE 2 - P10 SOFT CONFIDENCE REFINEMENT
 # ===================================================================
 def guided_filter(guide, src, radius, eps):
+    """
+    A "guided filter" -- a classic image-processing technique that
+    sharpens/smooths one image (`src`) using the structure of a second,
+    sharper image (`guide`) as a reference, while staying close to
+    src's own values. Conceptually it's a local linear regression: in
+    every small sliding window of size (2*radius+1), it finds the best
+    local linear relationship "src ~ a * guide + b" (the standard
+    least-squares slope/intercept formulas: a = Cov(guide, src) /
+    Var(guide), b = mean(src) - a * mean(guide)), then re-expresses
+    src through that local relationship. The effect: src ends up
+    following guide's sharp edges instead of staying blurry, while
+    still tracking src's own overall values.
+
+    In apply_p10(), `guide` is the real SAR brightness image and `src`
+    is one class's blurry, Gaussian-smoothed soft-probability map --
+    so this step "snaps" each class's fuzzy probability map onto the
+    actual sharp edges visible in the SAR data, rather than leaving it
+    blurred from the earlier Gaussian-blur step.
+
+    `eps` is a small regularisation constant preventing division by
+    zero when a window has near-zero brightness variance (a perfectly
+    flat patch of guide).
+    """
     size = 2 * radius + 1
     mg = uniform_filter(guide, size)
     ms = uniform_filter(src, size)
@@ -215,6 +462,77 @@ def guided_filter(guide, src, radius, eps):
 
 
 def apply_p10(pred_raw, sar_norm, valid, scene_type):
+    """
+    "P10" -- refine the P8 hard label map using a combination of
+    (a) manufactured soft probabilities, (b) fixed scene-type priors,
+    and (c) real per-pixel SAR brightness/texture statistics.
+
+    IMPORTANT CAVEAT: `pred_raw` here is the *hard* P8 output (one
+    integer per pixel) -- AlignEarth's original softmax probabilities
+    from run_alignearth() are NOT passed in. So the "soft" probabilities
+    built in step (1) below are reconstructed from the hard labels via
+    blurring, not the model's true confidence scores.
+
+    STEP-BY-STEP:
+
+    (1) Hard labels -> soft probabilities via Gaussian blur:
+        For each class c, take the binary mask (pred_raw == c) -- 1.0
+        where this pixel was labelled c, 0.0 elsewhere -- and blur it
+        with a Gaussian kernel (sigma=3). A pixel deep inside a solid
+        region of class c stays close to 1.0 after blurring (all its
+        neighbours agree); a pixel near a class boundary gets pulled
+        towards an intermediate value, since some of its blurred
+        neighbourhood belonged to a different class. After blurring
+        all 6 classes independently, the per-pixel values are
+        renormalised to sum to 1 (a genuine probability distribution).
+        This step is purely geometric -- "how far is this pixel from
+        a class boundary" -- not based on any model confidence.
+
+    (2) Scene-type confidence multipliers:
+        Multiply each class's soft probability by a fixed prior from
+        CONFIDENCE_ADJUST (e.g. in "mine" scenes, class 1/building
+        gets multiplied by 0.02 -- a hard-coded belief that real
+        buildings are extremely rare in open-pit mines, so most
+        "building" predictions there are probably misclassified
+        bright rock/rubble). Renormalise afterwards.
+
+    (3) SAR intensity decomposition -- genuine per-pixel statistics:
+        - Road penalty: pixels currently labelled road (class 2) that
+          are unusually BRIGHT (> 0.10) get their road-probability
+          reduced, scaled linearly by how far over 0.10 they are
+          (roads should look dark in SAR; a bright "road" pixel is
+          suspicious).
+        - Mine-specific building/texture check: computes a genuine
+          local statistic -- the coefficient of variation (local std
+          / local mean) of SAR brightness in an 11x11 window, using
+          the identity Var = E[X^2] - E[X]^2 via two uniform_filter
+          passes. Low local texture variance for a "building" pixel
+          (i.e. smooth, not rough) reduces its building-probability,
+          since real buildings tend to scatter SAR signal with more
+          local roughness/variation than smooth bright ground.
+        - Water penalty: bright pixels labelled water (class 4) get
+          penalised similarly to the road case (water should be dark).
+        - Building dark-penalty: dim pixels labelled building get a
+          mild probability reduction scaled by how dark they are.
+        Renormalise after all of these.
+
+    (4) Guided-filter sharpening:
+        Run every class's soft-probability map through guided_filter()
+        against the real SAR brightness image, snapping each class's
+        fuzzy probability boundaries onto the SAR image's actual sharp
+        edges. Renormalise once more.
+
+    (5) Re-argmax:
+        Collapse the final, reweighted soft probabilities back down to
+        a single hard label per pixel (whichever class now has the
+        highest probability), and zero out any pixel that was outside
+        the originally valid SAR footprint (`~valid`).
+
+    Net effect: this stage corrects systematic model biases that
+    AlignEarth's purely visual, tile-based predictions can't account
+    for on their own -- e.g. "bright + textured = building" being a
+    bad rule specifically inside an open-pit mine.
+    """
     H, W = sar_norm.shape
     conf_adj = CONFIDENCE_ADJUST.get(scene_type, {})
 
@@ -272,6 +590,55 @@ def apply_p10(pred_raw, sar_norm, valid, scene_type):
 # STAGE 3 - P11 WATERSHED EDGE CARVING
 # ===================================================================
 def carve_blob(blob_mask, sar_norm, thresh):
+    """
+    Subdivide a single connected blob of road (class 2) pixels into
+    the multiple real materials it probably actually contains, using
+    a watershed transform seeded by SAR brightness. Called from
+    apply_p11() only for blobs whose brightness is NOT uniform (i.e.
+    likely several adjacent materials wrongly merged under one label
+    by the coarser P8/P10 stages).
+
+    STEP-BY-STEP:
+
+    1. Crop to a tight bounding box around just this blob (plus a 20px
+       margin), so the expensive operations below run on a small patch
+       rather than the whole scene.
+
+    2. If the blob's brightness IS actually uniform (std < 0.10) after
+       all -- this is a second safety check inside carve_blob itself,
+       separate from the std check that decided to call carve_blob in
+       the first place -- just relabel the whole blob by its mean
+       brightness and return early, skipping watershed entirely.
+
+    3. Seed generation: erode the blob inward by ~3px (`disk(3)`) to
+       discard unreliable edge pixels, then split the eroded interior
+       into three brightness categories purely by the scene-type
+       thresholds: dark (`dk`, below thresh["road"]), bright (`br`,
+       above thresh["bareland"]), and medium (`md`, in between). Each
+       category is connected-component labelled separately (so
+       multiple disconnected dark patches become distinct seeds, not
+       one merged seed) and folded into one combined `markers` array
+       with globally unique integer IDs per seed.
+
+    4. Watershed transform: treats the (lightly blurred, to reduce
+       noise) SAR brightness surface as literal terrain -- dark =
+       valley, bright = peak -- and simulates flooding outward from
+       every seed simultaneously. Each seed's "water" claims
+       neighbouring pixels until it would meet another seed's water,
+       at which point a boundary forms there. `mask=bc` constrains the
+       flood to stay inside the original blob.
+
+    5. Reclassify each resulting watershed region by its own actual
+       mean brightness (not just by which seed-category it grew from,
+       since a region can absorb pixels of slightly different
+       brightness during flooding) against the same road/bareland
+       thresholds, producing the final per-pixel class assignment.
+
+    6. Paste the cropped result back into a full-size array at the
+       original coordinates, zeroing anything outside the original
+       blob (so this function never touches pixels outside the one
+       blob it was asked to carve).
+    """
     H, W = sar_norm.shape
     ys, xs = np.where(blob_mask)
     if len(ys) == 0:
@@ -324,6 +691,58 @@ def carve_blob(blob_mask, sar_norm, thresh):
 
 
 def apply_p11(pred, sar_norm, valid, scene_type):
+    """
+    "P11" -- final geometric cleanup pass on top of the P10 result,
+    using three independent fixes:
+
+    (1) Flood-fill water connectivity fix:
+        Computes local brightness variance in an 11x11 window (same
+        Var = E[X^2] - E[X]^2 trick as in apply_p10) to find regions
+        that are both dark AND smooth/low-texture (`lv < 0.003`) --
+        the SAR signature of calm open water, as opposed to merely
+        dark land (e.g. dark asphalt, which still has texture). Among
+        those candidate water pixels, it specifically keeps only the
+        connected components that TOUCH the image border (`border`
+        mask) and exceed 5000 pixels in size -- the logic being that a
+        genuine open-water body (sea, large river) is large and almost
+        always connects out to the edge of any cropped satellite
+        scene, whereas a small, landlocked dark/smooth patch is more
+        likely a different material that happens to look superficially
+        similar. Any pixel passing all these checks gets force-set to
+        class 4 (water), unless it was already vegetation (class 3) --
+        a defensive guard against overwriting likely-correct
+        vegetation pixels that can sometimes share the "dark and
+        smooth" signature.
+
+    (2) Watershed edge carving on large road blobs:
+        For every connected blob of class-2 (road) pixels larger than
+        CARVE_MIN_AREA (2000px): if the blob's brightness is uniform
+        (std < 0.10), just relabel the whole thing by its mean
+        brightness against the scene's thresholds. If the brightness
+        is mixed (multiple real materials likely merged into one
+        label), call carve_blob() to split it via watershed -- see
+        that function's docstring for the full mechanism.
+
+    (3) Small-fragment cleanup:
+        For each class, find connected components smaller than 30
+        pixels -- almost certainly noise/misclassification specks
+        rather than real features -- and reassign each such fragment's
+        pixels to whatever class is closest to them spatially, using
+        `distance_transform_edt(..., return_indices=True)` (a
+        Euclidean distance transform that, alongside the distance
+        itself, also returns the *coordinates* of the nearest
+        "non-fragment" pixel for every fragment pixel -- those
+        coordinates are then used to look up and copy that nearest
+        pixel's class). This is skipped if there are either zero or
+        an enormous number (>10000) of such tiny fragments, the latter
+        being a safety valve against pathological cases where this
+        cleanup would be extremely slow for little benefit.
+
+    Finally, any pixel outside the original valid SAR footprint
+    (`~valid`) is forced back to background (0), since none of the
+    fixes above should be able to manufacture a real class label
+    inside a no-data region.
+    """
     H, W = sar_norm.shape
     pred_out = pred.copy()
     thresh = BRIGHTNESS_THRESHOLDS[scene_type]
@@ -383,6 +802,35 @@ def apply_p11(pred, sar_norm, valid, scene_type):
 
 
 def add_building_outlines(pred_out, sar_norm, rgb):
+    """
+    Purely cosmetic post-processing for the final output PNG: draws a
+    thin dark outline around each building (class 1) blob, so building
+    footprints are visually easier to pick out against the surrounding
+    classes. This does NOT change any pixel's class label in
+    `pred_out` -- it only modifies the colour image `rgb` that gets
+    saved to disk.
+
+    HOW THE OUTLINE IS FOUND:
+      1. Compute the SAR image's local gradient magnitude using Sobel
+         operators (`sobel(..., axis=0)` for vertical edges, `axis=1`
+         for horizontal; combined via Pythagorean sum) on a lightly
+         blurred copy of the SAR brightness -- this highlights actual
+         edges/boundaries in the underlying radar data.
+      2. For each building blob bigger than 200 pixels: take the
+         gradient values within that blob, find their 90th percentile,
+         and keep only the pixels whose gradient exceeds that
+         threshold (`be`) -- i.e. the strongest, most edge-like 10% of
+         pixels within this building.
+      3. Erode the blob inward twice with a plus-shaped structuring
+         element, then intersect with `be` -- this restricts the
+         "edge" pixels to ones that are also a few pixels in from the
+         blob's true boundary, producing a clean, thin line rather
+         than a noisy scattering of high-gradient pixels anywhere
+         inside the building.
+      4. Collect all such edge pixels across every building blob into
+         one mask, then paint those pixels black ([0, 0, 0]) directly
+         in the output RGB image.
+    """
     building_mask = (pred_out == 1)
     if not building_mask.any():
         return
@@ -411,9 +859,42 @@ def add_building_outlines(pred_out, sar_norm, rgb):
 # ===================================================================
 def derive_scene_type_vlm(sar_norm, geochat_dir, groq_key_path):
     """
-    Use GeoChat + Groq to classify the scene and derive thresholds.
-    Returns (scene_type, thresholds_dict). Falls back to 'urban' on error.
-    See ASSUMPTIONS.md for the prompt design and fallback behaviour.
+    OPTIONAL alternative to manually specifying --scene-type. Uses a
+    two-model chain to automatically guess the scene type (mine/port/
+    urban) and derive matching brightness thresholds, instead of using
+    the fixed BRIGHTNESS_THRESHOLDS/CONFIDENCE_ADJUST lookup tables
+    keyed by a human-supplied scene type.
+
+    Two-stage process:
+
+    1. GeoChat (a remote-sensing-specialised vision-language model,
+       loaded locally -- requires real GPU VRAM, not practical on a
+       CPU-only laptop) is shown a downsampled thumbnail of the SAR
+       scene with a prompt explaining SAR brightness conventions, and
+       asked to describe the scene in plain English (dominant land
+       cover, water presence, building density, etc.).
+
+    2. That text description is sent to Groq's cloud API (a fast LLM
+       inference service), along with a system prompt instructing it
+       to output a strict JSON object classifying the scene as mine/
+       port/urban and proposing specific road/bareland brightness
+       thresholds, given general domain knowledge about what SAR
+       brightness ranges typically correspond to which scene types.
+
+    The thresholds are clipped to sane ranges (`np.clip`) and a
+    sanity check (`if rt >= bt`) nudges the bareland threshold upward
+    if the model returned a nonsensical pair where road >= bareland.
+
+    Falls back to a fixed "urban" scene type with urban's default
+    thresholds if ANYTHING in this chain fails (GeoChat not available,
+    Groq API error, malformed JSON, etc.) -- wrapped in a broad
+    try/except specifically so that a failure in this optional,
+    automatic path never crashes the whole pipeline; the user can
+    always fall back to manually specifying --scene-type instead.
+
+    NOTE: this function is only ever called when --scene-type=auto.
+    For mine/port/urban, the pipeline skips this entirely and goes
+    straight to the fixed lookup tables -- no GPU or API key required.
     """
     try:
         # --- GeoChat scene description ---
@@ -509,6 +990,24 @@ def derive_scene_type_vlm(sar_norm, geochat_dir, groq_key_path):
 # MAIN
 # ===================================================================
 def main():
+    """
+    Entry point: parses CLI arguments, runs the three-stage pipeline
+    (P8 -> P10 -> P11) on the given SAR scene in order, and writes
+    out four files into --output:
+      <name>_p8.png    raw AlignEarth prediction
+      <name>_p10.png   after soft-confidence refinement
+      <name>_final.png final P11 result, with building outlines drawn
+      <name>_final.npy the same final result as a raw numpy array
+                        (uint8, values 0-5), for any downstream
+                        analysis that needs the class labels directly
+                        rather than a colour image
+
+    Device selection: `torch.device("cuda" if torch.cuda.is_available()
+    else "cpu")` automatically uses a GPU if one is present and visible
+    to PyTorch, otherwise falls back to CPU -- this is what allows the
+    exact same script to run unmodified on a GPU server or a CPU-only
+    laptop.
+    """
     ap = argparse.ArgumentParser(description="Single-image SAR segmentation")
     ap.add_argument("--input", required=True, help="Path to input SAR .tif")
     ap.add_argument("--output", required=True, help="Output directory")
