@@ -178,7 +178,7 @@ def run_alignearth(model, sar_norm, H, W, device):
         patch = sar_rgb[y:y + AE_TILE, x:x + AE_TILE]
         if patch.max() == 0:
             continue
-        tensor = transform(patch).unsqueeze(0).to(device).half()
+        tensor = transform(patch).unsqueeze(0).to(device)
         with torch.no_grad():
             logits = model.forward_feature(tensor)
             logits_up = F.interpolate(
