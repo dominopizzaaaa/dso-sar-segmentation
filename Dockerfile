@@ -52,6 +52,8 @@ RUN pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu
 
 # Core scientific / imaging stack
+# transformers is required by SegEarth-OV-2's bundled BLIP module
+# (segearth_segmentor.py -> BLIP/models/med.py -> transformers.activations)
 RUN pip install --no-cache-dir \
         pillow \
         rasterio \
@@ -61,7 +63,8 @@ RUN pip install --no-cache-dir \
         ftfy \
         regex \
         tqdm \
-        huggingface_hub
+        huggingface_hub \
+        transformers
 
 # MMSegmentation — install mmcv from OpenMMLab's prebuilt CPU wheel index
 # (matched to torch 2.1) so nothing compiles from source.
