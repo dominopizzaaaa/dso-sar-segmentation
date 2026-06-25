@@ -53,7 +53,12 @@ RUN pip install --no-cache-dir \
 
 # Core scientific / imaging stack
 # transformers is required by SegEarth-OV-2's bundled BLIP module
-# (segearth_segmentor.py -> BLIP/models/med.py -> transformers.activations)
+# (segearth_segmentor.py -> BLIP/models/med.py -> transformers.activations).
+# Pinned to 4.46.x: recent releases of transformers require torch>=2.4,
+# but this image is intentionally on torch 2.1.2 (matched to the prebuilt
+# mmcv cpu/torch2.1 wheel). 4.46.x is the latest line still compatible
+# with torch 2.1 and covers everything BLIP's med.py needs (BertConfig,
+# BertModel, ACT2FN).
 RUN pip install --no-cache-dir \
         pillow \
         rasterio \
@@ -64,7 +69,7 @@ RUN pip install --no-cache-dir \
         regex \
         tqdm \
         huggingface_hub \
-        transformers
+        "transformers==4.46.3"
 
 # MMSegmentation — install mmcv from OpenMMLab's prebuilt CPU wheel index
 # (matched to torch 2.1) so nothing compiles from source.
@@ -75,13 +80,15 @@ RUN pip install --no-cache-dir -U openmim && \
     pip install --no-cache-dir mmsegmentation
 
 # Belt-and-suspenders: reassert numpy<2 in case mim's pip pass bumped it,
-# then verify numpy<->torch interop actually works (not just that imports
-# succeed). This fails the build loudly if numpy is wrong.
+# then verify numpy<->torch interop AND transformers actually import (not
+# just that pip claimed success). This fails the build loudly instead of
+# surfacing as a runtime crash on someone's laptop three steps later.
 RUN pip install --no-cache-dir "numpy<2.0" && \
-    python -c "import numpy as np, torch, mmcv, mmseg, mmengine, rasterio, skimage, open_clip; \
+    python -c "import numpy as np, torch, mmcv, mmseg, mmengine, rasterio, skimage, open_clip, transformers; \
+from transformers.activations import ACT2FN; \
 assert np.__version__.startswith('1.'), 'numpy must be <2, got ' + np.__version__; \
 assert torch.from_numpy(np.zeros((2,2), dtype='float32')).sum().item() == 0.0; \
-print('OK | numpy', np.__version__, '| torch', torch.__version__, '| mmcv', mmcv.__version__, '| mmseg', mmseg.__version__)"
+print('OK | numpy', np.__version__, '| torch', torch.__version__, '| mmcv', mmcv.__version__, '| mmseg', mmseg.__version__, '| transformers', transformers.__version__)"
 
 # ---- Project code ----
 WORKDIR /app
